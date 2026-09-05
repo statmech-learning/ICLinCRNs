@@ -57,26 +57,74 @@ def apply_context_query_projection(z_context, z_query, K_proj=None, Q_proj=None)
     return z_context, z_query
 
 
+def _apply_mean_anisotropy(means, anisotropy):
+    """Scale axis 0 of class means. None or 1.0 leaves ``means`` unchanged."""
+    if anisotropy is None:
+        return means
+    a = float(anisotropy)
+    if a == 1.0:
+        return means
+    means = means.clone()
+    means[:, 0] = means[:, 0] * a
+    return means
+
+
+def _apply_mean_norm_spread(means, spread):
+    """
+    Multiply each class mean by an independent lognormal factor.
+
+    ``spread=None`` or ``0`` leaves ``means`` unchanged (original Gaussian).
+    ``spread=σ>0`` does μ_k ← μ_k * exp(σ g_k), g_k ~ N(0,1), so some classes
+    become long decoys for inner-product matching.
+    """
+    if spread is None:
+        return means
+    sigma = float(spread)
+    if sigma == 0.0:
+        return means
+    scales = torch.exp(sigma * torch.randn(means.shape[0], 1, device=means.device, dtype=means.dtype))
+    return means * scales
+
+
+def _sample_class_means(
+    n, D, offset=1.0, use_offset=False, equal_norm=False,
+    mean_anisotropy=None, mean_norm_spread=None,
+):
+    """Shared class-mean sampler for the stored GMM and novel ICL episodes."""
+    if equal_norm:
+        raw = torch.randn(n, D)
+        norms = raw.norm(dim=1, keepdim=True).clamp_min(1e-12)
+        radius = float(offset) if use_offset else 1.0
+        means = radius * (raw / norms)
+    elif use_offset:
+        means = offset * torch.randn(n, D) / np.sqrt(D)
+    else:
+        means = torch.randn(n, D) / np.sqrt(D)
+    if not equal_norm:
+        means = _apply_mean_anisotropy(means, mean_anisotropy)
+    return _apply_mean_norm_spread(means, mean_norm_spread)
+
+
 def _sample_novel_class_means(gmm, n_classes_in_context):
     """
     Sample episode-specific novel class mean vectors using the same rules as
-    ``GaussianMixtureModel`` (equal_norm sphere, use_offset scaling, or default Gaussians).
+    ``GaussianMixtureModel``.
     """
-    D = gmm.D
-    if gmm.equal_norm:
-        raw = torch.randn(n_classes_in_context, D)
-        norms = raw.norm(dim=1, keepdim=True).clamp_min(1e-12)
-        radius = float(gmm.offset) if gmm.use_offset else 1.0
-        return radius * (raw / norms)
-    if gmm.use_offset:
-        return gmm.offset * torch.randn(n_classes_in_context, D) / np.sqrt(D)
-    return torch.randn(n_classes_in_context, D) / np.sqrt(D)
+    return _sample_class_means(
+        n_classes_in_context,
+        gmm.D,
+        offset=gmm.offset,
+        use_offset=gmm.use_offset,
+        equal_norm=gmm.equal_norm,
+        mean_anisotropy=getattr(gmm, "mean_anisotropy", None),
+        mean_norm_spread=getattr(gmm, "mean_norm_spread", None),
+    )
 
 
 class GaussianMixtureModel:
     """Gaussian Mixture Model with K classes for ICL task with DISCRETE labels."""
     
-    def __init__(self, K, D, L=None, epsilon=0.1, seed=None, label_min=0.0, label_max=1.0, offset=1.0, use_offset=False, equal_norm=False):
+    def __init__(self, K, D, L=None, epsilon=0.1, seed=None, label_min=0.0, label_max=1.0, offset=1.0, use_offset=False, equal_norm=False, mean_anisotropy=None, mean_norm_spread=None):
         """
         Initialize Gaussian Mixture Model.
         
@@ -91,6 +139,12 @@ class GaussianMixtureModel:
             equal_norm: If True, all class mean vectors have the same Euclidean norm (random
                 directions). Radius matches the typical scale of the default sampling:
                 1.0 without use_offset, else ``offset``.
+            mean_anisotropy: If not None, multiply class-mean coordinate 0 by this factor
+                after isotropic sampling (a=1 is isotropic). Ignored when equal_norm=True.
+                Within-class noise is left isotropic.
+            mean_norm_spread: If not None, multiply each class mean by exp(σ g_k),
+                g_k ~ N(0,1). σ=0 is the original Gaussian. Applied after anisotropy.
+                Within-class noise stays isotropic.
         """
         self.K = K
         self.D = D
@@ -101,20 +155,20 @@ class GaussianMixtureModel:
         self.offset = offset
         self.use_offset = use_offset
         self.equal_norm = equal_norm
+        self.mean_anisotropy = mean_anisotropy
+        self.mean_norm_spread = mean_norm_spread
         if seed is not None:
             torch.manual_seed(seed)
             np.random.seed(seed)
         
-        # Sample class means from standard Gaussian scaled by 1/sqrt(D)
-        if equal_norm:
-            raw = torch.randn(K, D)
-            norms = raw.norm(dim=1, keepdim=True).clamp_min(1e-12)
-            radius = float(offset) if use_offset else 1.0
-            self.class_means = radius * (raw / norms)
-        elif use_offset:
-            self.class_means = self.offset * torch.randn(K, D) / np.sqrt(D)
-        else:
-            self.class_means = torch.randn(K, D) / np.sqrt(D)
+        self.class_means = _sample_class_means(
+            K, D,
+            offset=offset,
+            use_offset=use_offset,
+            equal_norm=equal_norm,
+            mean_anisotropy=mean_anisotropy,
+            mean_norm_spread=mean_norm_spread,
+        )
         
         # Randomly assign each of K classes a label from {1, 2, ..., L}
         # This allows L < K (multiple classes can share the same label)
@@ -246,13 +300,17 @@ def generate_icl_gmm_data(gmm, n_samples, N, novel_classes=False, exact_copy=Tru
                 # --- Original behavior: possibly repeated labels ---
                 context_classes = torch.randint(0, gmm.K, (n_classes_in_context,))
             else:
-                # --- Unique labels mode: one per distinct label ---
-                # Randomly sample distinct labels
-                n_unique = min(n_classes_in_context, gmm.L)
-                chosen_labels = torch.randperm(gmm.L)[:n_unique] + 1  # labels are 1..L
-                # Pick one random class from each chosen label group
+                # --- Unique labels mode: one per distinct nonempty label ---
+                nonempty_labels = [lbl for lbl, idxs in gmm.label_to_classes.items() if len(idxs) > 0]
+                if len(nonempty_labels) < n_classes_in_context:
+                    raise ValueError(
+                        f"unique_labels requires at least {n_classes_in_context} nonempty "
+                        f"labels, got {len(nonempty_labels)}"
+                    )
+                chosen_idx = torch.randperm(len(nonempty_labels))[:n_classes_in_context]
+                chosen_labels = [nonempty_labels[i] for i in chosen_idx.tolist()]
                 context_classes = torch.tensor([
-                    np.random.choice(gmm.label_to_classes[int(lbl.item())])
+                    np.random.choice(gmm.label_to_classes[int(lbl)])
                     for lbl in chosen_labels
                 ], dtype=torch.long)
 

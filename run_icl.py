@@ -40,7 +40,7 @@ output_dir = args.output
 L = 128                      # Number of output classes
 K = L                      # Number of GMM classes for data generation
 D = 4                        # Dimension of input features
-N = args.param2               # Number of context examples per task
+N = args.param1               # Number of context examples per task
 B = 1                        # Burstiness parameter (zipfian sampling weight)
 epsilon = 1e-3               # Within-class noise (standard deviation)
 seed = args.param3           # Random seed for reproducibility
@@ -61,16 +61,32 @@ input_proj_dim = D
 # ============================================================
 # Model Architecture Parameters
 # ============================================================
-n_nodes = args.param1                  # Number of nodes in the Markov chain
-transform_func = 'exp'       # Transformation function: 'exp', 'relu', or 'elu'
+n_nodes = args.param2                  # Number of nodes in the Markov chain
+transform_func = 'identity'       # 'exp', 'relu', 'elu', 'softplus', 'sigmoid', or 'identity'
 learn_base_rates = True      # If True, allow gradient updates to unmasked base rates
 
-rate_encoder_type = "mlp"  # 'linear' (K·z) or 'mlp' (z → n_nodes² log-rate shift)
+rate_encoder_type = "linear"  # 'linear' (K·z) or 'mlp' (z → n_nodes² log-rate shift)
 encoder_mlp_depth = 2
 encoder_mlp_width = 32
-rate_decoder_type = "mlp"  # 'linear' (π @ B) or 'mlp' decoder head
+rate_decoder_type = "linear"  # 'linear' (π @ B) or 'mlp' decoder head
 decoder_mlp_depth = 2
 decoder_mlp_width = 32
+
+# Detailed-balance split (linear encoder only). "directed" keeps the original model.
+rate_param = "directed"      # "directed" or "db_split"
+db_phi0 = 1e6                # Hinge threshold on each force scalar
+db_lambda = 100.0            # Weight on DB hinge penalty (ignored unless db_split)
+
+# Node map M(z) -> n-vector, and which of K / B train.
+# hidden_map: 'crn' (Wπ=0), 'linear' (column sums of transform(M) if LINEAR_HIDDEN_MAP_APPLY_TRANSFORM else M),
+#             'relu' (ReLU of column sums of M),
+#             'frozen_mlp' (frozen MLP on off-diagonal transform(M) if FROZEN_MLP_HIDDEN_MAP_APPLY_TRANSFORM else M)
+# Freeze encoder: random CRN features, train readout. Freeze decoder: train CRN, random B.
+hidden_map = "frozen_mlp"
+hidden_mlp_depth = 2
+hidden_mlp_width = 4
+learn_rate_encoder = True
+learn_rate_decoder = True
 
 add_qk = False
 qk_dim = input_proj_dim       # Key/query latent dimension for QK baseline
@@ -139,6 +155,14 @@ params = {
     'rate_decoder_type': rate_decoder_type,
     'decoder_mlp_depth': decoder_mlp_depth,
     'decoder_mlp_width': decoder_mlp_width,
+    'rate_param': rate_param,
+    'db_phi0': db_phi0,
+    'db_lambda': db_lambda,
+    'hidden_map': hidden_map,
+    'hidden_mlp_depth': hidden_mlp_depth,
+    'hidden_mlp_width': hidden_mlp_width,
+    'learn_rate_encoder': learn_rate_encoder,
+    'learn_rate_decoder': learn_rate_decoder,
     'qk_dim': qk_dim,
     'mlp_baseline_depth': mlp_baseline_depth,
     'mlp_baseline_width': mlp_baseline_width,
@@ -186,6 +210,21 @@ print(
     f"Rate decoder: {params['rate_decoder_type']} "
     f"(mlp depth/width={params['decoder_mlp_depth']}/{params['decoder_mlp_width']} if mlp)"
 )
+print(f"Rate param: {params['rate_param']}")
+if params['rate_param'] == 'db_split':
+    print(f"DB constraint: phi0={params['db_phi0']}, lambda={params['db_lambda']}")
+print(
+    f"Hidden map: {params['hidden_map']}, "
+    f"learn encoder/decoder={params['learn_rate_encoder']}/{params['learn_rate_decoder']}"
+)
+if params['hidden_map'] == 'frozen_mlp':
+    print(
+        f"Frozen hidden MLP: depth={params['hidden_mlp_depth']}, "
+        f"width={params['hidden_mlp_width']} "
+        f"(on off-diagonal {params['transform_func']}(M) if FROZEN_MLP_HIDDEN_MAP_APPLY_TRANSFORM else M)"
+    )
+if params['hidden_map'] == 'linear':
+    print(f"Linear hidden map transform: {params['transform_func']}")
 print(
     f"Input projection: mode={params['input_proj_mode']}, "
     f"dim={params['input_proj_dim']}, scale={params['input_proj_scale']}"
@@ -242,6 +281,10 @@ train_loader = DataLoader(ICLGMMDataset(train_data), batch_size=params['batch_si
 val_loader = DataLoader(ICLGMMDataset(val_data), batch_size=params['batch_size'],
                        collate_fn=collate_fn)
 
+if params['rate_param'] == 'db_split' and params['rate_encoder_type'] != 'linear':
+    print("rate_param='db_split' requires a linear rate encoder; overriding rate_encoder_type='linear'.")
+    params['rate_encoder_type'] = 'linear'
+
 # Create models
 print("\nCreating model...")
 markov_model = MatrixTreeMarkovICL(
@@ -261,6 +304,14 @@ markov_model = MatrixTreeMarkovICL(
     rate_decoder_type=params['rate_decoder_type'],
     decoder_mlp_depth=params['decoder_mlp_depth'],
     decoder_mlp_width=params['decoder_mlp_width'],
+    rate_param=params['rate_param'],
+    db_phi0=params['db_phi0'],
+    db_lambda=params['db_lambda'],
+    hidden_map=params['hidden_map'],
+    hidden_mlp_depth=params['hidden_mlp_depth'],
+    hidden_mlp_width=params['hidden_mlp_width'],
+    learn_rate_encoder=params['learn_rate_encoder'],
+    learn_rate_decoder=params['learn_rate_decoder'],
 )
 models_to_train = {'markov': markov_model}
 

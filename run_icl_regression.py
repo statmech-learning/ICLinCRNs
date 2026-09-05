@@ -53,6 +53,13 @@ context_scorer_type = "linear"
 mlp_depth = 4
 mlp_width = 32
 
+# hidden_map: 'crn' (Wπ=0), 'linear' (column sums of transform(M) if LINEAR_HIDDEN_MAP_APPLY_TRANSFORM else M),
+#             'relu' (ReLU of column sums of M),
+#             'frozen_mlp' (frozen MLP on off-diagonal transform(M) if FROZEN_MLP_HIDDEN_MAP_APPLY_TRANSFORM else M)
+hidden_map = "crn"
+hidden_mlp_depth = 2
+hidden_mlp_width = 16
+
 # Notebook: train MLP baseline alongside Markov (no CLI flag)
 add_mlp = True
 mlp_baseline_depth = 4
@@ -92,6 +99,9 @@ params = {
     "context_scorer_type": context_scorer_type,
     "mlp_depth": mlp_depth,
     "mlp_width": mlp_width,
+    "hidden_map": hidden_map,
+    "hidden_mlp_depth": hidden_mlp_depth,
+    "hidden_mlp_width": hidden_mlp_width,
     "add_mlp": add_mlp,
     "mlp_baseline_depth": mlp_baseline_depth,
     "mlp_baseline_width": mlp_baseline_width,
@@ -119,6 +129,15 @@ print(
     f"Markov regression head: {context_scorer_type} "
     f"(mlp_depth={mlp_depth}, mlp_width={mlp_width})"
 )
+print(f"Hidden map: {hidden_map}")
+if hidden_map == "frozen_mlp":
+    print(
+        f"Frozen hidden MLP: depth={hidden_mlp_depth}, "
+        f"width={hidden_mlp_width} "
+        f"(on off-diagonal {transform_func}(M) if FROZEN_MLP_HIDDEN_MAP_APPLY_TRANSFORM else M)"
+    )
+if hidden_map == "linear":
+    print(f"Linear hidden map transform: {transform_func}")
 print(
     f"MLP baseline: add_mlp={add_mlp} "
     f"(depth={mlp_baseline_depth}, width={mlp_baseline_width}, "
@@ -177,6 +196,9 @@ markov_model = MatrixTreeMarkovICLRegression(
     context_scorer_type=context_scorer_type,
     mlp_depth=mlp_depth,
     mlp_width=mlp_width,
+    hidden_map=hidden_map,
+    hidden_mlp_depth=hidden_mlp_depth,
+    hidden_mlp_width=hidden_mlp_width,
 )
 models_to_train = {"markov": markov_model}
 if add_mlp:

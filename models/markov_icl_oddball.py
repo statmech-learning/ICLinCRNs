@@ -35,6 +35,9 @@ class MatrixTreeMarkovICLOddball(MatrixTreeMarkovICL):
         rate_decoder_type="linear",
         decoder_mlp_depth=2,
         decoder_mlp_width=64,
+        hidden_map="crn",
+        hidden_mlp_depth=2,
+        hidden_mlp_width=64,
         print_creation=True,
     ):
         super().__init__(
@@ -55,6 +58,10 @@ class MatrixTreeMarkovICLOddball(MatrixTreeMarkovICL):
             rate_decoder_type=rate_decoder_type,
             decoder_mlp_depth=decoder_mlp_depth,
             decoder_mlp_width=decoder_mlp_width,
+            hidden_map=hidden_map,
+            hidden_mlp_depth=hidden_mlp_depth,
+            hidden_mlp_width=hidden_mlp_width,
+            learn_rate_encoder=True,
             print_creation=False,
         )
 
@@ -63,8 +70,14 @@ class MatrixTreeMarkovICLOddball(MatrixTreeMarkovICL):
 
         if print_creation:
             print(f"  Initialized Markov ICL Oddball model (N={N}, L={N}, z_dim={z_dim})")
+            print(f"  Hidden map: {hidden_map}")
             print(f"  Rate encoder: {self.rate_encoder_type}")
             print(f"  Rate decoder: {self.rate_decoder_type}")
+            if hidden_map == "frozen_mlp":
+                print(
+                    f"  Frozen hidden MLP: depth={hidden_mlp_depth}, "
+                    f"width={hidden_mlp_width}"
+                )
             print(f"  Parameters: {self.get_num_parameters():,}")
 
     def _rebuild_context_only_encoder(self, z_full_dim):
@@ -100,7 +113,7 @@ class MatrixTreeMarkovICLOddball(MatrixTreeMarkovICL):
         """
         Args:
             z_context_batch: (batch_size, N, z_dim)
-            method: steady-state solver
+            method: steady-state solver (used only when hidden_map='crn')
             temperature: softmax temperature
 
         Returns:
@@ -108,19 +121,7 @@ class MatrixTreeMarkovICLOddball(MatrixTreeMarkovICL):
         """
         batch_size = z_context_batch.shape[0]
         z_flat = z_context_batch.reshape(batch_size, -1)
-
-        W_batch = self.compute_rate_matrix_W(z_flat)
-
-        if method == "matrix_tree":
-            p_batch = self.matrix_tree_steady_state(W_batch)
-        elif method == "linear_solver":
-            p_batch = self.linear_solver_steady_state(W_batch)
-        elif method == "direct_solve":
-            p_batch = self.direct_solve_steady_state(W_batch)
-        elif method == "newton":
-            p_batch = self.newton_steady_state(W_batch, n_iter=30)
-        else:
-            raise ValueError(f"Invalid method: {method}")
+        p_batch = self._node_state(z_flat, method=method)
 
         if self.rate_decoder_type == "linear":
             scores = torch.matmul(p_batch, self.B)

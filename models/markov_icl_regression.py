@@ -32,6 +32,9 @@ class MatrixTreeMarkovICLRegression(MatrixTreeMarkovICL):
         context_scorer_type="linear",
         mlp_depth=2,
         mlp_width=64,
+        hidden_map="crn",
+        hidden_mlp_depth=2,
+        hidden_mlp_width=64,
         print_creation=True,
     ):
         # Set L=1 so parent BaseICLModel initializes cleanly.
@@ -50,6 +53,10 @@ class MatrixTreeMarkovICLRegression(MatrixTreeMarkovICL):
             context_scorer_type=context_scorer_type,
             mlp_depth=mlp_depth,
             mlp_width=mlp_width,
+            hidden_map=hidden_map,
+            hidden_mlp_depth=hidden_mlp_depth,
+            hidden_mlp_width=hidden_mlp_width,
+            learn_rate_encoder=True,
             print_creation=False,
         )
 
@@ -79,9 +86,15 @@ class MatrixTreeMarkovICLRegression(MatrixTreeMarkovICL):
 
         if print_creation:
             print(f"  Initialized Markov ICL Regression model (N={N})")
+            print(f"  Hidden map: {hidden_map}")
             print(f"  Context/regression scorer: {context_scorer_type}")
             if context_scorer_type == "mlp":
                 print(f"  MLP scorer: depth={mlp_depth}, width={mlp_width}, activation=relu")
+            if hidden_map == "frozen_mlp":
+                print(
+                    f"  Frozen hidden MLP: depth={hidden_mlp_depth}, "
+                    f"width={hidden_mlp_width}"
+                )
             print(f"  Parameters: {self.get_num_parameters():,}")
 
     def forward(self, z_seq_batch, method="direct_solve"):
@@ -89,27 +102,14 @@ class MatrixTreeMarkovICLRegression(MatrixTreeMarkovICL):
         Args:
             z_seq_batch: (batch_size, N+1, z_dim)
             method: steady-state solver ('matrix_tree', 'linear_solver',
-                'direct_solve', or 'newton')
+                'direct_solve', or 'newton'). Used only when hidden_map='crn'.
 
         Returns:
             y_hat: (batch_size,) scalar regression prediction
         """
         batch_size = z_seq_batch.shape[0]
         z_flat = z_seq_batch.reshape(batch_size, -1)
-
-        W_batch = self.compute_rate_matrix_W(z_flat)
-
-        if method == "matrix_tree":
-            p_batch = self.matrix_tree_steady_state(W_batch)
-        elif method == "linear_solver":
-            p_batch = self.linear_solver_steady_state(W_batch)
-        elif method == "direct_solve":
-            p_batch = self.direct_solve_steady_state(W_batch)
-        elif method == "newton":
-            p_batch = self.newton_steady_state(W_batch, n_iter=30)
-        else:
-            raise ValueError(f"Invalid method: {method}")
-
+        p_batch = self._node_state(z_flat, method=method)
         y_hat = self.regression_head(p_batch).squeeze(-1)
         return y_hat
 
@@ -129,6 +129,9 @@ def load_model_regression(params, path, print_creation=True):
         context_scorer_type=params.get("context_scorer_type", "linear"),
         mlp_depth=params.get("mlp_depth", 2),
         mlp_width=params.get("mlp_width", 64),
+        hidden_map=params.get("hidden_map", "crn"),
+        hidden_mlp_depth=params.get("hidden_mlp_depth", 2),
+        hidden_mlp_width=params.get("hidden_mlp_width", 64),
         print_creation=print_creation,
     )
 

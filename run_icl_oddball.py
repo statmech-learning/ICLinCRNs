@@ -51,6 +51,13 @@ rate_decoder_type = "linear"
 decoder_mlp_depth = 2
 decoder_mlp_width = 32
 
+# hidden_map: 'crn' (Wπ=0), 'linear' (column sums of transform(M) if LINEAR_HIDDEN_MAP_APPLY_TRANSFORM else M),
+#             'relu' (ReLU of column sums of M),
+#             'frozen_mlp' (frozen MLP on off-diagonal transform(M) if FROZEN_MLP_HIDDEN_MAP_APPLY_TRANSFORM else M)
+hidden_map = "crn"
+hidden_mlp_depth = 2
+hidden_mlp_width = 16
+
 add_mlp = True
 mlp_baseline_depth = 4
 mlp_baseline_width = 64
@@ -92,6 +99,9 @@ params = {
     "rate_decoder_type": rate_decoder_type,
     "decoder_mlp_depth": decoder_mlp_depth,
     "decoder_mlp_width": decoder_mlp_width,
+    "hidden_map": hidden_map,
+    "hidden_mlp_depth": hidden_mlp_depth,
+    "hidden_mlp_width": hidden_mlp_width,
     "add_mlp": add_mlp,
     "mlp_baseline_depth": mlp_baseline_depth,
     "mlp_baseline_width": mlp_baseline_width,
@@ -128,6 +138,15 @@ print(
     f"Markov: encoder={rate_encoder_type}, decoder={rate_decoder_type} "
     f"(mlp {encoder_mlp_depth}x{encoder_mlp_width} / {decoder_mlp_depth}x{decoder_mlp_width})"
 )
+print(f"Hidden map: {hidden_map}")
+if hidden_map == "frozen_mlp":
+    print(
+        f"Frozen hidden MLP: depth={hidden_mlp_depth}, "
+        f"width={hidden_mlp_width} "
+        f"(on off-diagonal {transform_func}(M) if FROZEN_MLP_HIDDEN_MAP_APPLY_TRANSFORM else M)"
+    )
+if hidden_map == "linear":
+    print(f"Linear hidden map transform: {transform_func}")
 print(
     f"MLP baseline: add_mlp={add_mlp} "
     f"(depth={mlp_baseline_depth}, width={mlp_baseline_width})"
@@ -192,6 +211,9 @@ markov_model = MatrixTreeMarkovICLOddball(
     rate_decoder_type=rate_decoder_type,
     decoder_mlp_depth=decoder_mlp_depth,
     decoder_mlp_width=decoder_mlp_width,
+    hidden_map=hidden_map,
+    hidden_mlp_depth=hidden_mlp_depth,
+    hidden_mlp_width=hidden_mlp_width,
 )
 models_to_train = {"markov": markov_model}
 if add_mlp:

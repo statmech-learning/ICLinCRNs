@@ -12,14 +12,21 @@ The Matrix Tree Theorem gives:
 where W^(i) is obtained by deleting row i and column i from W.
 
 Naming convention:
-- K: learnable parameters (K_params) that map context to rate matrix W
-- W: computed rate matrix from K and context
+- Linear rate encoder: K_params maps flattened z to per-edge log-rate shifts.
+- MLP rate encoder: MLP maps z to n_nodes^2 shifts (full connectivity; ignores K sparsity masks).
+- W: computed rate matrix from base rates, encoder modulation, and optional label mod.
+- Rate decoder: maps steady-state π to length-N scores (canonical name); `context_scorer*` kept as aliases.
 """
 
+import os
+import warnings
 import torch
 import torch.nn as nn
 import numpy as np
 from .base_icl_model import BaseICLModel
+
+_LEGACY_DECODER_PREFIX = "context_scorer."
+_CANON_DECODER_PREFIX = "rate_decoder."
 
 
 class MatrixTreeMarkovICL(BaseICLModel):
@@ -37,8 +44,22 @@ class MatrixTreeMarkovICL(BaseICLModel):
                  learn_base_rates=True, transform_func='exp',
                  sparsity_rho_edge=1.0, sparsity_rho_all=1.0,
                  sparsity_rho_edge_base_W=1.0, base_mask_value=0.0,
-                 context_scorer_type='linear', mlp_depth=2, mlp_width=64,
-                 print_creation=True):
+                 rate_encoder_type='linear',
+                 encoder_mlp_depth=2,
+                 encoder_mlp_width=64,
+                 rate_decoder_type=None,
+                 decoder_mlp_depth=None,
+                 decoder_mlp_width=None,
+                 context_scorer_type='linear',
+                 mlp_depth=None,
+                 mlp_width=None,
+                 print_creation=True,
+                 rate_param='directed',
+                 db_phi0=0.0,
+                 db_lambda=100.0,
+                 hidden_map='crn',
+                 learn_rate_encoder=True,
+                 learn_rate_decoder=True):
         """
         Initialize Markov ICL model.
         
@@ -54,9 +75,24 @@ class MatrixTreeMarkovICL(BaseICLModel):
             sparsity_rho_all: Fraction of non-zero elements in per-element mask (all dims)
             sparsity_rho_edge_base_W: Fraction of (i,j) edges with base rates in W
             base_mask_value: Value for masked base rates (0.0 or float('-inf'))
-            context_scorer_type: 'linear' or 'mlp' mapping from steady-state to context scores
-            mlp_depth: Number of linear layers for MLP context scorer (>=2)
-            mlp_width: Hidden width used by MLP context scorer
+            rate_encoder_type: 'linear' (K_params · z) or 'mlp' (dense z → n_nodes² shift)
+            encoder_mlp_depth: MLP layers for rate encoder (>=2) when rate_encoder_type='mlp'
+            encoder_mlp_width: Hidden width for rate encoder MLP
+            rate_decoder_type: 'linear' or 'mlp' (π → context scores). Preferred over context_scorer_type.
+            decoder_mlp_depth: MLP depth for rate decoder (>=2) when rate_decoder_type='mlp'
+            decoder_mlp_width: Hidden width for rate decoder MLP
+            context_scorer_type: Deprecated alias for rate_decoder_type (must agree if both set)
+            mlp_depth: Deprecated alias for decoder_mlp_depth
+            mlp_width: Deprecated alias for decoder_mlp_width
+            rate_param: 'directed' (original independent log-rates) or 'db_split'
+                (node energy / symmetric barrier / antisymmetric force).
+            db_phi0: Hinge threshold on each force scalar (only used if rate_param='db_split').
+            db_lambda: Weight on the detailed-balance hinge penalty.
+            hidden_map: How M maps to the n-vector that hits the decoder:
+                'crn' (steady state of W), 'linear' (off-diagonal column sums of M),
+                or 'relu' (ReLU of those sums).
+            learn_rate_encoder: If False, freeze K / base (or DB tensors) at init.
+            learn_rate_decoder: If False, freeze B / MLP decoder at a semi-orthogonal init.
         """
         super().__init__(n_nodes=n_nodes, z_dim=z_dim, L=L, N=N)
         self.n_nodes = n_nodes
@@ -67,11 +103,92 @@ class MatrixTreeMarkovICL(BaseICLModel):
         self.sparsity_rho_edge_base_W = sparsity_rho_edge_base_W
         self.base_mask_value = base_mask_value
         self.learn_base_rates = learn_base_rates
-        self.context_scorer_type = context_scorer_type
-        self.mlp_depth = mlp_depth
-        self.mlp_width = mlp_width
+        if rate_param not in ('directed', 'db_split'):
+            raise ValueError(f"Invalid rate_param: {rate_param}. Expected 'directed' or 'db_split'")
+        self.rate_param = rate_param
+        self.db_phi0 = float(db_phi0)
+        self.db_lambda = float(db_lambda)
+        if hidden_map not in ('crn', 'linear', 'relu'):
+            raise ValueError(
+                f"Invalid hidden_map: {hidden_map}. Expected 'crn', 'linear', or 'relu'"
+            )
+        self.hidden_map = hidden_map
+        self.learn_rate_encoder = bool(learn_rate_encoder)
+        self.learn_rate_decoder = bool(learn_rate_decoder)
+        if not self.learn_rate_encoder and not self.learn_rate_decoder:
+            raise ValueError("Cannot freeze both rate encoder and rate decoder")
+
+        if rate_decoder_type is not None and context_scorer_type != 'linear':
+            if rate_decoder_type != context_scorer_type:
+                raise ValueError(
+                    "Conflicting rate_decoder_type and context_scorer_type "
+                    f"({rate_decoder_type!r} vs {context_scorer_type!r})"
+                )
+        if rate_decoder_type is not None:
+            rd_type = rate_decoder_type
+        else:
+            rd_type = context_scorer_type
+            if context_scorer_type == 'mlp':
+                warnings.warn(
+                    "context_scorer_type='mlp' is deprecated; use rate_decoder_type='mlp' instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+
+        if (
+            decoder_mlp_depth is not None
+            and mlp_depth is not None
+            and decoder_mlp_depth != mlp_depth
+        ):
+            raise ValueError(
+                "Conflicting decoder_mlp_depth and mlp_depth "
+                f"({decoder_mlp_depth} vs {mlp_depth})"
+            )
+        if (
+            decoder_mlp_width is not None
+            and mlp_width is not None
+            and decoder_mlp_width != mlp_width
+        ):
+            raise ValueError(
+                "Conflicting decoder_mlp_width and mlp_width "
+                f"({decoder_mlp_width} vs {mlp_width})"
+            )
+        legacy_mlp_depth = mlp_depth if mlp_depth is not None else 2
+        legacy_mlp_width = mlp_width if mlp_width is not None else 64
+        dd = decoder_mlp_depth if decoder_mlp_depth is not None else legacy_mlp_depth
+        dw = decoder_mlp_width if decoder_mlp_width is not None else legacy_mlp_width
+
+        if rate_encoder_type not in ('linear', 'mlp'):
+            raise ValueError(f"Invalid rate_encoder_type: {rate_encoder_type}")
+        if rate_param == 'db_split':
+            if rate_encoder_type != 'linear':
+                raise ValueError("rate_param='db_split' requires rate_encoder_type='linear'")
+            if transform_func != 'exp':
+                raise ValueError("rate_param='db_split' requires transform_func='exp'")
+            if use_label_mod:
+                raise ValueError("rate_param='db_split' does not support use_label_mod=True")
+        if rd_type not in ('linear', 'mlp'):
+            raise ValueError(
+                f"Invalid rate_decoder_type: {rd_type}. Expected 'linear' or 'mlp'"
+            )
+        if rd_type == 'mlp' and dd < 2:
+            raise ValueError("decoder_mlp_depth must be >= 2 when rate_decoder_type='mlp'")
+        if rate_encoder_type == 'mlp' and encoder_mlp_depth < 2:
+            raise ValueError("encoder_mlp_depth must be >= 2 when rate_encoder_type='mlp'")
+
+        self.rate_encoder_type = rate_encoder_type
+        self.encoder_mlp_depth = encoder_mlp_depth
+        self.encoder_mlp_width = encoder_mlp_width
+        self.rate_decoder_type = rd_type
+        self.decoder_mlp_depth = dd
+        self.decoder_mlp_width = dw
+        # Deprecated mirrors (kept in sync for external code)
+        self.context_scorer_type = rd_type
+        self.mlp_depth = dd
+        self.mlp_width = dw
         
         z_full_dim = (N + 1) * z_dim  # Flatten all context + query
+        self.z_full_dim = z_full_dim
         l_full_dim = N
         
         # Initialize parameters with proper scaling
@@ -79,8 +196,48 @@ class MatrixTreeMarkovICL(BaseICLModel):
         init_scale_B = 0.1 / np.sqrt(N)
         init_base = -2.0 - 0.5 * np.log(n_nodes)
         
-        # Learnable parameters for rate matrix (modulated by z)
-        self.K_params = nn.Parameter(torch.randn(n_nodes, n_nodes, z_full_dim) * init_scale_K)
+        self.energy_bias = None
+        self.energy_weight = None
+        self.barrier_bias = None
+        self.barrier_weight = None
+        self.force_bias = None
+        self.force_weight = None
+
+        if rate_param == 'db_split':
+            self.K_params = None
+            self.rate_encoder = None
+            self.base_log_rates_W = None
+            # Node energy E_n(z) = beta_n + kappa_n · z
+            self.energy_bias = nn.Parameter(torch.zeros(n_nodes))
+            self.energy_weight = nn.Parameter(
+                torch.randn(n_nodes, z_full_dim) * init_scale_K
+            )
+            # Symmetric barrier B_ji(z); only upper triangle (j > i) is used
+            self.barrier_bias = nn.Parameter(
+                torch.zeros(n_nodes, n_nodes) + (-init_base)
+            )
+            self.barrier_weight = nn.Parameter(
+                torch.randn(n_nodes, n_nodes, z_full_dim) * init_scale_K
+            )
+            # Antisymmetric force F_ji(z); only upper triangle is used
+            self.force_bias = nn.Parameter(torch.zeros(n_nodes, n_nodes))
+            self.force_weight = nn.Parameter(
+                torch.zeros(n_nodes, n_nodes, z_full_dim)
+            )
+        elif rate_encoder_type == 'linear':
+            self.K_params = nn.Parameter(
+                torch.randn(n_nodes, n_nodes, z_full_dim) * init_scale_K
+            )
+            self.rate_encoder = None
+        else:
+            self.K_params = None
+            out_dim = n_nodes * n_nodes
+            ed, ew = encoder_mlp_depth, encoder_mlp_width
+            enc_layers = [nn.Linear(z_full_dim, ew), nn.ReLU()]
+            for _ in range(ed - 2):
+                enc_layers.extend([nn.Linear(ew, ew), nn.ReLU()])
+            enc_layers.append(nn.Linear(ew, out_dim))
+            self.rate_encoder = nn.Sequential(*enc_layers)
         
         # Optional: modulate rates by context labels
         if self.use_label_mod:
@@ -90,62 +247,77 @@ class MatrixTreeMarkovICL(BaseICLModel):
         else:
             self.label_modulation = None
         
-        # Context scorer maps steady-state probabilities to context position scores.
-        if context_scorer_type == 'linear':
-            self.B = nn.Parameter(torch.randn(n_nodes, N) * init_scale_B)
-            self.context_scorer = None
-        elif context_scorer_type == 'mlp':
-            if mlp_depth < 2:
-                raise ValueError("mlp_depth must be >= 2 when context_scorer_type='mlp'")
-            layers = [nn.Linear(n_nodes, mlp_width), nn.ReLU()]
-            for _ in range(mlp_depth - 2):
-                layers.extend([nn.Linear(mlp_width, mlp_width), nn.ReLU()])
-            layers.append(nn.Linear(mlp_width, N))
-            self.context_scorer = nn.Sequential(*layers)
+        # Rate decoder: node features → context position scores
+        if rd_type == 'linear':
+            if self.learn_rate_decoder:
+                self.B = nn.Parameter(torch.randn(n_nodes, N) * init_scale_B)
+            else:
+                self.B = nn.Parameter(self._semi_orthogonal_decoder(n_nodes, N))
+                self.B.requires_grad = False
+            self.rate_decoder = None
+        else:
+            layers = [nn.Linear(n_nodes, dw), nn.ReLU()]
+            for _ in range(dd - 2):
+                layers.extend([nn.Linear(dw, dw), nn.ReLU()])
+            layers.append(nn.Linear(dw, N))
+            self.rate_decoder = nn.Sequential(*layers)
             self.B = None
-        else:
-            raise ValueError(
-                f"Invalid context_scorer_type: {context_scorer_type}. "
-                "Expected 'linear' or 'mlp'"
-            )
+            if not self.learn_rate_decoder:
+                for p in self.rate_decoder.parameters():
+                    p.requires_grad = False
+        self.context_scorer = self.rate_decoder
         
-        # Base log rates for W
-        # Note: To get zero base rates, set sparsity_rho_edge_base_W = 0.0 with base_mask_value = 0.0
-        self.base_log_rates_W = nn.Parameter(torch.randn(n_nodes, n_nodes) * 0.1 + init_base)
-        
-        # Set fixed seed for sparsity mask generation (ensures reproducibility across models)
-        #torch.manual_seed(42)
-        
-        # Create sparsity masks for K_params and base rates
-        self._create_sparsity_masks(z_full_dim)
-        
-        # Set up gradient masking for base rates if learn_base_rates is False
-        # or if we want to only learn unmasked base rates
-        if not learn_base_rates:
-            self.base_log_rates_W.requires_grad = False
-        else:
-            # Register hooks to zero out gradients for masked base rates
-            self.base_log_rates_W.register_hook(
-                lambda grad: grad * self.base_log_rates_W_mask
-            )
+        if rate_param != 'db_split':
+            # Base log rates for W
+            # Note: To get zero base rates, set sparsity_rho_edge_base_W = 0.0 with base_mask_value = 0.0
+            self.base_log_rates_W = nn.Parameter(torch.randn(n_nodes, n_nodes) * 0.1 + init_base)
+
+            # Create sparsity masks for K_params (linear encoder) and base rates
+            self._create_sparsity_masks(z_full_dim)
+
+            # Set up gradient masking for base rates if learn_base_rates is False
+            # or if we want to only learn unmasked base rates
+            if not learn_base_rates:
+                self.base_log_rates_W.requires_grad = False
+            else:
+                # Register hooks to zero out gradients for masked base rates
+                self.base_log_rates_W.register_hook(
+                    lambda grad: grad * self.base_log_rates_W_mask
+                )
+
+        if not self.learn_rate_encoder:
+            self._freeze_rate_encoder()
         
         if print_creation:
             print(f"  Initialized ICL Attention model (L={L} classes, "
                 f"attention over {N} context items)")
             print(f"  Label modulation: {self.use_label_mod}")
-            print(f"  Base rates learnable: {learn_base_rates}")
-            print(f"  Context scorer: {context_scorer_type}")
-            if context_scorer_type == 'mlp':
-                print(f"  MLP scorer: depth={mlp_depth}, width={mlp_width}, activation=relu")
-            print(f"  Base mask value: {base_mask_value}")
-            print(f"  Sparsity K: rho_edge={sparsity_rho_edge:.3f}, rho_all={sparsity_rho_all:.3f}")
-            print(f"  Sparsity base_W: rho_edge={sparsity_rho_edge_base_W:.3f}")
-            sparsity_stats = self.get_sparsity_stats()
-            if sparsity_stats:
-                print(f"  K_params sparsity: {sparsity_stats['K_actual_sparsity']:.3f} "
-                    f"({sparsity_stats['K_num_active']}/{sparsity_stats['K_num_total']} active)")
-                print(f"  base_W sparsity: {sparsity_stats['base_W_actual_sparsity']:.3f} "
-                    f"({sparsity_stats['base_W_num_active']}/{sparsity_stats['base_W_num_total']} active)")
+            print(f"  Hidden map: {hidden_map}")
+            print(f"  Learn rate encoder: {self.learn_rate_encoder}")
+            print(f"  Learn rate decoder: {self.learn_rate_decoder}")
+            if rate_param == 'db_split':
+                print(f"  DB hinge: phi0={self.db_phi0}, lambda={self.db_lambda}")
+            else:
+                print(f"  Base rates learnable: {learn_base_rates}")
+            print(f"  Rate encoder: {rate_encoder_type}")
+            if rate_encoder_type == 'mlp':
+                print(
+                    f"  Encoder MLP: depth={encoder_mlp_depth}, width={encoder_mlp_width}, "
+                    "activation=relu"
+                )
+            print(f"  Rate decoder: {rd_type}")
+            if rd_type == 'mlp':
+                print(f"  Decoder MLP: depth={dd}, width={dw}, activation=relu")
+            if rate_param != 'db_split':
+                print(f"  Base mask value: {base_mask_value}")
+                print(f"  Sparsity K: rho_edge={sparsity_rho_edge:.3f}, rho_all={sparsity_rho_all:.3f}")
+                print(f"  Sparsity base_W: rho_edge={sparsity_rho_edge_base_W:.3f}")
+                sparsity_stats = self.get_sparsity_stats()
+                if sparsity_stats:
+                    print(f"  K_params sparsity: {sparsity_stats['K_actual_sparsity']:.3f} "
+                        f"({sparsity_stats['K_num_active']}/{sparsity_stats['K_num_total']} active)")
+                    print(f"  base_W sparsity: {sparsity_stats['base_W_actual_sparsity']:.3f} "
+                        f"({sparsity_stats['base_W_num_active']}/{sparsity_stats['base_W_num_total']} active)")
             print(f"  Parameters: {self.get_num_parameters():,}")
     
     def _create_sparsity_masks(self, z_full_dim):
@@ -167,6 +339,18 @@ class MatrixTreeMarkovICL(BaseICLModel):
             z_full_dim: Full dimension of z features
         """
         n = self.n_nodes
+
+        if self.rate_encoder_type == 'mlp':
+            # Dense encoder: treat every (i,j) as input-modulated for base-rate mask coupling.
+            k_edge_active = torch.ones(n, n)
+            if self.sparsity_rho_edge_base_W < 1.0:
+                edge_mask_samples_W = torch.rand(n, n)
+                base_mask_W = (edge_mask_samples_W < self.sparsity_rho_edge_base_W).float()
+            else:
+                base_mask_W = torch.ones(n, n)
+            base_mask_W = torch.maximum(base_mask_W, k_edge_active)
+            self.register_buffer('base_log_rates_W_mask', base_mask_W)
+            return
         
         # Per-edge mask: same across all input dimensions
         if self.sparsity_rho_edge < 1.0:
@@ -209,11 +393,136 @@ class MatrixTreeMarkovICL(BaseICLModel):
         # Register as buffer
         self.register_buffer('base_log_rates_W_mask', base_mask_W)
     
+    def _pair_masks(self, device, dtype, extra_dim=False):
+        """Upper-triangle mask for undirected pairs j > i."""
+        n = self.n_nodes
+        triu = torch.triu(torch.ones(n, n, device=device, dtype=dtype), diagonal=1)
+        if extra_dim:
+            triu = triu.unsqueeze(-1)
+        return triu
+
+    def _symmetric_from_upper(self, tensor):
+        """Build a symmetric matrix from the strictly upper triangle."""
+        extra = tensor.dim() == 3
+        upper = tensor * self._pair_masks(tensor.device, tensor.dtype, extra_dim=extra)
+        if extra:
+            return upper + upper.transpose(0, 1)
+        return upper + upper.transpose(0, 1)
+
+    def _antisymmetric_from_upper(self, tensor):
+        """Build an antisymmetric matrix from the strictly upper triangle (F_ji at [i,j], j>i)."""
+        extra = tensor.dim() == 3
+        upper = tensor * self._pair_masks(tensor.device, tensor.dtype, extra_dim=extra)
+        if extra:
+            return upper - upper.transpose(0, 1)
+        return upper - upper.transpose(0, 1)
+
+    def _db_split_log_rates(self, z_batch):
+        """
+        Affine DB split: log k_{j→i} = E_j - B_ji + F_ji/2.
+        Stored at W index [i,j] = k_{j→i}.
+        """
+        energy = self.energy_bias.unsqueeze(0) + torch.matmul(z_batch, self.energy_weight.T)
+        barrier_bias = self._symmetric_from_upper(self.barrier_bias)
+        barrier_weight = self._symmetric_from_upper(self.barrier_weight)
+        force_bias = self._antisymmetric_from_upper(self.force_bias)
+        force_weight = self._antisymmetric_from_upper(self.force_weight)
+        barrier = barrier_bias.unsqueeze(0) + torch.einsum('ijd,bd->bij', barrier_weight, z_batch)
+        force = force_bias.unsqueeze(0) + torch.einsum('ijd,bd->bij', force_weight, z_batch)
+        # log W[b,i,j] = E[b,j] - B[b,i,j] + F[b,i,j]/2
+        return energy.unsqueeze(1) - barrier + 0.5 * force
+
+    def detailed_balance_penalty(self, phi0=None, lam=None):
+        """
+        Equal hinge on every force scalar in the upper triangle.
+
+        L_DB = λ Σ_{j>i} [ ReLU(|φ_ji| - φ⁰)² + Σ_m ReLU(|ψ_ji,m| - φ⁰)² ]
+        """
+        if self.rate_param != 'db_split' or self.force_bias is None:
+            device = next(self.parameters()).device
+            dtype = next(self.parameters()).dtype
+            return torch.zeros((), device=device, dtype=dtype)
+
+        phi0 = self.db_phi0 if phi0 is None else float(phi0)
+        lam = self.db_lambda if lam is None else float(lam)
+        if lam == 0.0 or phi0 == float('inf'):
+            return self.force_bias.sum() * 0.0
+
+        idx = torch.triu_indices(
+            self.n_nodes, self.n_nodes, offset=1, device=self.force_bias.device
+        )
+        force_scalars = torch.cat([
+            self.force_bias[idx[0], idx[1]].reshape(-1),
+            self.force_weight[idx[0], idx[1], :].reshape(-1),
+        ])
+        excess = torch.relu(force_scalars.abs() - phi0)
+        return lam * excess.pow(2).sum()
+
+    @staticmethod
+    def _semi_orthogonal_decoder(n_nodes, N):
+        """Well-conditioned frozen B: orthonormal columns if n>=N, else orthonormal rows."""
+        raw = torch.randn(n_nodes, N)
+        if n_nodes >= N:
+            q, _ = torch.linalg.qr(raw, mode='reduced')
+            return q
+        q, _ = torch.linalg.qr(raw.T, mode='reduced')
+        return q.T
+
+    def _freeze_rate_encoder(self):
+        """Freeze couplings that build M(z): K/base, MLP encoder, or DB tensors."""
+        for p in (
+            self.K_params,
+            self.base_log_rates_W,
+            self.label_modulation,
+            self.energy_bias,
+            self.energy_weight,
+            self.barrier_bias,
+            self.barrier_weight,
+            self.force_bias,
+            self.force_weight,
+        ):
+            if p is not None:
+                p.requires_grad = False
+        if self.rate_encoder is not None:
+            for p in self.rate_encoder.parameters():
+                p.requires_grad = False
+
+    def compute_log_rate_matrix(self, z_batch, labels_batch=None):
+        """Affine log-rate matrix M(z), shape (batch, n_nodes, n_nodes)."""
+        batch_size = z_batch.shape[0]
+        n = self.n_nodes
+
+        if self.rate_param == 'db_split':
+            log_rates = self._db_split_log_rates(z_batch)
+        else:
+            if self.rate_encoder_type == 'linear':
+                K_params_masked = self.K_params * self.K_params_mask
+                K_expanded = K_params_masked.unsqueeze(0).expand(batch_size, -1, -1, -1)
+                rate_mod = torch.einsum('bijd,bd->bij', K_expanded, z_batch)
+            else:
+                rate_mod = self.rate_encoder(z_batch).view(batch_size, n, n)
+
+            if self.use_label_mod and labels_batch is not None:
+                label_expanded = self.label_modulation.unsqueeze(0).expand(batch_size, -1, -1, -1)
+                label_mod = torch.einsum('bijd,bd->bij', label_expanded, labels_batch)
+                rate_mod = rate_mod + label_mod
+
+            base_masked = torch.where(
+                self.base_log_rates_W_mask.bool(),
+                self.base_log_rates_W,
+                torch.full_like(self.base_log_rates_W, self.base_mask_value)
+            )
+            base_expanded = base_masked.unsqueeze(0).expand(batch_size, -1, -1)
+            log_rates = base_expanded + rate_mod
+
+        return torch.clamp(log_rates, min=np.log(1e-6), max=np.log(1e6))
+
     def compute_rate_matrix_W(self, z_batch, labels_batch=None):
         """
         Compute the rate matrix W from parameters K where columns sum to zero.
         
-        W[i,j] = exp(base[i,j] + K_params[i,j] · z + label_mod[i,j] · labels) for i≠j
+        Linear encoder: W[i,j] ∝ transform(base + K[i,j]·z + label_mod).
+        MLP encoder: W[i,j] ∝ transform(base + MLP(z)[i,j] + label_mod).
         W[j,j] = -Σ_{k≠j} W[k,j]
         
         Args:
@@ -225,37 +534,7 @@ class MatrixTreeMarkovICL(BaseICLModel):
         """
         batch_size = z_batch.shape[0]
         n = self.n_nodes
-        
-        # Apply sparsity mask to K_params
-        K_params_masked = self.K_params * self.K_params_mask
-        
-        # Compute modulation: K_params · z
-        K_expanded = K_params_masked.unsqueeze(0).expand(batch_size, -1, -1, -1)
-        rate_mod = torch.einsum('bijd,bd->bij', K_expanded, z_batch)
-        
-        # Optional: Add label modulation
-        if self.use_label_mod and labels_batch is not None:
-            label_expanded = self.label_modulation.unsqueeze(0).expand(batch_size, -1, -1, -1)
-            label_mod = torch.einsum('bijd,bd->bij', label_expanded, labels_batch)
-            rate_mod = rate_mod + label_mod
-        
-        # Add base rates with masking
-        # Apply mask: set masked elements to base_mask_value (0.0 or -inf)
-        base_masked = torch.where(
-            self.base_log_rates_W_mask.bool(),
-            self.base_log_rates_W,
-            torch.full_like(self.base_log_rates_W, self.base_mask_value)
-        )
-        base_expanded = base_masked.unsqueeze(0).expand(batch_size, -1, -1)
-        log_rates = base_expanded + rate_mod
-        
-        # Clamp for numerical stability
-        
-        log_rates = torch.clamp(log_rates, min=np.log(1e-6), max=np.log(1e6))
-        
-        #log_rates = torch.clamp(log_rates, min=-15, max=15)
-        
-        # Apply transformation to get rates
+        log_rates = self.compute_log_rate_matrix(z_batch, labels_batch=labels_batch)
         if self.transform_func == 'exp':
             rates = torch.exp(log_rates)
         elif self.transform_func == 'relu':
@@ -378,7 +657,6 @@ class MatrixTreeMarkovICL(BaseICLModel):
     def direct_solve_steady_state(self, W_batch):
         """
         Replace last row of W with normalization constraint and solve directly.
-        Falls back to normal equations with regularization if direct solve fails.
         
         Args:
             W_batch: (batch_size, n_nodes, n_nodes) - rate matrix
@@ -486,6 +764,28 @@ class MatrixTreeMarkovICL(BaseICLModel):
         
         return p_batch
     
+    def _node_state(self, z_flat, method='direct_solve', labels_batch=None):
+        """Map encoder matrix M(z) to an n-vector (π, or a linear/ReLU stand-in)."""
+        if self.hidden_map in ('linear', 'relu'):
+            M = self.compute_log_rate_matrix(z_flat, labels_batch=labels_batch)
+            n = self.n_nodes
+            eye = torch.eye(n, device=M.device, dtype=M.dtype).unsqueeze(0)
+            p_batch = (M * (1.0 - eye)).sum(dim=1)
+            if self.hidden_map == 'relu':
+                p_batch = torch.relu(p_batch)
+            return p_batch
+
+        W_batch = self.compute_rate_matrix_W(z_flat, labels_batch=labels_batch)
+        if method == 'matrix_tree':
+            return self.matrix_tree_steady_state(W_batch)
+        if method == 'linear_solver':
+            return self.linear_solver_steady_state(W_batch)
+        if method == 'newton':
+            return self.newton_steady_state(W_batch, n_iter=30)
+        if method == 'direct_solve':
+            return self.direct_solve_steady_state(W_batch)
+        raise ValueError(f"Invalid method: {method}")
+
     def forward(self, z_seq_batch, labels_seq_batch, method='direct_solve', temperature=1.0):
         """
         Forward pass with attention over context items.
@@ -512,27 +812,13 @@ class MatrixTreeMarkovICL(BaseICLModel):
         
         # Flatten z sequences
         z_flat = z_seq_batch.reshape(batch_size, -1)
-        
-        # Compute rate matrix W from parameters K
-        W_batch = self.compute_rate_matrix_W(z_flat)
-        
-        # Compute steady state
-        if method == 'matrix_tree':
-            p_batch = self.matrix_tree_steady_state(W_batch)
-        elif method == 'linear_solver':
-            p_batch = self.linear_solver_steady_state(W_batch)
-        elif method == 'direct_solve':
-            p_batch = self.direct_solve_steady_state(W_batch)
-        elif method == 'newton':
-            p_batch = self.newton_steady_state(W_batch, n_iter = 30)
-        else:
-            raise ValueError(f"Invalid method: {method}")
+        p_batch = self._node_state(z_flat, method=method)
         
         # Compute context position scores from steady-state probabilities.
-        if self.context_scorer_type == 'linear':
+        if self.rate_decoder_type == 'linear':
             q = torch.matmul(p_batch, self.B)  # (batch_size, N)
         else:
-            q = self.context_scorer(p_batch)  # (batch_size, N)
+            q = self.rate_decoder(p_batch)  # (batch_size, N)
         
         # Apply temperature and softmax to get attention over context positions
         attention = torch.softmax(q / temperature, dim=1)  # (batch_size, N)
@@ -553,6 +839,21 @@ class MatrixTreeMarkovICL(BaseICLModel):
         logits = torch.log(logits)
         
         return logits
+
+    def load_state_dict(self, state_dict, strict=True):
+        """Accept checkpoints saved under legacy name ``context_scorer`` for the decoder MLP."""
+        has_new = any(k.startswith(_CANON_DECODER_PREFIX) for k in state_dict)
+        remapped = {}
+        for key, value in state_dict.items():
+            if key.startswith(_LEGACY_DECODER_PREFIX) and not has_new:
+                remapped[
+                    _CANON_DECODER_PREFIX + key[len(_LEGACY_DECODER_PREFIX):]
+                ] = value
+            elif key.startswith(_LEGACY_DECODER_PREFIX) and has_new:
+                continue
+            else:
+                remapped[key] = value
+        return super().load_state_dict(remapped, strict=strict)
     
     def get_sparsity_stats(self):
         """
@@ -561,13 +862,17 @@ class MatrixTreeMarkovICL(BaseICLModel):
         Returns:
             dict with sparsity information for K and base_W, or None if no masks exist
         """
-        if not hasattr(self, 'K_params_mask'):
+        if self.rate_param == 'db_split' or not hasattr(self, 'base_log_rates_W_mask'):
             return None
         
-        # K_params stats
-        mask_K = self.K_params_mask
-        num_total_K = mask_K.numel()
-        num_active_K = mask_K.sum().item()
+        if self.rate_encoder_type == 'linear':
+            mask_K = self.K_params_mask
+            num_total_K = mask_K.numel()
+            num_active_K = mask_K.sum().item()
+        else:
+            nn = self.n_nodes
+            num_total_K = nn * nn
+            num_active_K = num_total_K
         actual_sparsity_K = 1.0 - (num_active_K / num_total_K)
         
         # base_log_rates_W stats
@@ -596,8 +901,9 @@ class MatrixTreeMarkovICL(BaseICLModel):
         Useful for experiments testing different random masks.
         Resamples masks for K_params and base_log_rates_W.
         """
-        z_full_dim = self.K_params.shape[2]
-        self._create_sparsity_masks(z_full_dim)
+        if self.rate_param == 'db_split':
+            return
+        self._create_sparsity_masks(self.z_full_dim)
         
         # Re-register gradient hooks for base rates if learn_base_rates is True
         if self.learn_base_rates:
@@ -613,17 +919,87 @@ class MatrixTreeMarkovICL(BaseICLModel):
         Returns:
             List of tuples [(i, j), ...] representing active edges
         """
-        if not hasattr(self, 'K_params_mask'):
-            # No mask, all edges are active
+        if self.rate_encoder_type == 'mlp':
             return [(i, j) for i in range(self.n_nodes) for j in range(self.n_nodes)]
         
-        # Sum across z_dim to see which (i,j) pairs have any active params
+        if not hasattr(self, 'K_params_mask'):
+            return [(i, j) for i in range(self.n_nodes) for j in range(self.n_nodes)]
+        
         edge_active = self.K_params_mask.sum(dim=2) > 0  # (n_nodes, n_nodes)
         active_indices = torch.nonzero(edge_active, as_tuple=False)
         
         return [(i.item(), j.item()) for i, j in active_indices]
 
+    def db_violation_measure(self, z_batch=None):
+        """
+        Mean size of the antisymmetric DB-violation terms.
+
+        Without z_batch: mean |φ̃| and |ψ̃| over upper-triangle scalars.
+        With z_batch: mean |F_ji(z)| = |φ̃_ji + ψ̃_ji · z| over samples and pairs.
+        Directed models return zeros.
+        """
+        zeros = {'mean_abs_force_params': 0.0, 'mean_abs_F': None}
+        if self.rate_param != 'db_split' or self.force_bias is None:
+            return zeros
+
+        idx = torch.triu_indices(
+            self.n_nodes, self.n_nodes, offset=1, device=self.force_bias.device
+        )
+        force_params = torch.cat([
+            self.force_bias[idx[0], idx[1]].reshape(-1),
+            self.force_weight[idx[0], idx[1], :].reshape(-1),
+        ])
+        out = {
+            'mean_abs_force_params': force_params.abs().mean().item(),
+            'mean_abs_F': None,
+        }
+        if z_batch is None:
+            return out
+
+        z_flat = z_batch.reshape(z_batch.shape[0], -1) if z_batch.dim() == 3 else z_batch
+        with torch.no_grad():
+            Fb = self._antisymmetric_from_upper(self.force_bias)
+            Fw = self._antisymmetric_from_upper(self.force_weight)
+            F = Fb.unsqueeze(0) + torch.einsum('ijd,bd->bij', Fw, z_flat)
+            out['mean_abs_F'] = F[:, idx[0], idx[1]].abs().mean().item()
+        return out
+
+    def average_db_violation(self, data_loader, n_samples=500):
+        """
+        Mean |F(z)| over examples from ``data_loader`` (default 500 samples).
+
+        Also returns the parameter-space mean |φ̃|, |ψ̃|, which does not depend on data.
+        """
+        out = self.db_violation_measure()
+        if self.rate_param != 'db_split' or self.force_bias is None:
+            out['mean_abs_F'] = 0.0
+            out['n_samples'] = 0
+            return out
+
+        device = self.force_bias.device
+        weighted_sum = 0.0
+        count = 0
+        self.eval()
+        with torch.no_grad():
+            for batch in data_loader:
+                z_seq = batch[0] if isinstance(batch, (tuple, list)) else batch
+                z_seq = z_seq.to(device)
+                take = min(n_samples - count, z_seq.shape[0])
+                if take <= 0:
+                    break
+                stats = self.db_violation_measure(z_seq[:take])
+                weighted_sum += stats['mean_abs_F'] * take
+                count += take
+                if count >= n_samples:
+                    break
+
+        out['mean_abs_F'] = weighted_sum / count if count else 0.0
+        out['n_samples'] = count
+        return out
+
     def get_non_zero_count_K(self):
+        if self.K_params is None:
+            return 0
         K_array = np.array(self.K_params.detach().numpy() * self.K_params_mask.detach().numpy())
         s = K_array.shape
         non_zero_count = 0
@@ -641,24 +1017,44 @@ def load_model(params, path, print_creation = True):
     """Load a MarkovICL model from saved weights.
     
     Args:
-        params: Dictionary containing model parameters
-        path: Path to directory containing model.pt file
+        params: Dictionary containing model parameters (as saved by ``run_icl.py``)
+        path: Path to directory containing model.pt file (trailing slash optional)
         
     Returns:
         model: Loaded model in evaluation mode on appropriate device
     """
-    model = MatrixTreeMarkovICL(n_nodes=params['n_nodes'], z_dim=params['D'], 
-                               L=params['L'], N=params['N'], 
-                               learn_base_rates=params['learn_base_rates'],
-                               transform_func=params['transform_func'],
-                               sparsity_rho_edge=params['sparsity_rho_edge'], 
-                               sparsity_rho_all=params['sparsity_rho_all'],
-                               sparsity_rho_edge_base_W=params['sparsity_rho_edge_base_W'],
-                               base_mask_value=params['base_mask_value'],
-                               context_scorer_type=params.get('context_scorer_type', 'linear'),
-                               mlp_depth=params.get('mlp_depth', 2),
-                               mlp_width=params.get('mlp_width', 64),
-                               print_creation=print_creation)
+    if not path.endswith(os.sep):
+        path = path + os.sep
+    z_dim = params.get("input_proj_dim", params["D"])
+    model = MatrixTreeMarkovICL(
+        n_nodes=params["n_nodes"],
+        z_dim=z_dim,
+        L=params["L"],
+        N=params["N"],
+        use_label_mod=params.get("use_label_mod", False),
+        learn_base_rates=params.get("learn_base_rates", True),
+        transform_func=params.get("transform_func", "exp"),
+        sparsity_rho_edge=params.get("sparsity_rho_edge", 1.0),
+        sparsity_rho_all=params.get("sparsity_rho_all", 1.0),
+        sparsity_rho_edge_base_W=params.get("sparsity_rho_edge_base_W", 1.0),
+        base_mask_value=params.get("base_mask_value", 0.0),
+        rate_encoder_type=params.get("rate_encoder_type", "linear"),
+        encoder_mlp_depth=params.get("encoder_mlp_depth", 2),
+        encoder_mlp_width=params.get("encoder_mlp_width", 64),
+        rate_decoder_type=params.get("rate_decoder_type"),
+        decoder_mlp_depth=params.get("decoder_mlp_depth"),
+        decoder_mlp_width=params.get("decoder_mlp_width"),
+        context_scorer_type=params.get("context_scorer_type", "linear"),
+        mlp_depth=params.get("mlp_depth"),
+        mlp_width=params.get("mlp_width"),
+        print_creation=print_creation,
+        rate_param=params.get("rate_param", "directed"),
+        db_phi0=params.get("db_phi0", 0.0),
+        db_lambda=params.get("db_lambda", 100.0),
+        hidden_map=params.get("hidden_map", "crn"),
+        learn_rate_encoder=params.get("learn_rate_encoder", True),
+        learn_rate_decoder=params.get("learn_rate_decoder", True),
+    )
     
     model_path = path + 'model.pt'
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

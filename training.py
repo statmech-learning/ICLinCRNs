@@ -10,6 +10,60 @@ import numpy as np
 from evaluation import evaluate_iwl, evaluate_icl_novel#, evaluate_icl_swap
 
 
+def _nll_with_db_penalty(model, nll_loss):
+    """Add optional detailed-balance hinge; no-op for models without the method."""
+    penalty_fn = getattr(model, "detailed_balance_penalty", None)
+    if penalty_fn is None:
+        zero = nll_loss.detach() * 0.0
+        return nll_loss, zero
+    penalty = penalty_fn()
+    return nll_loss + penalty, penalty
+
+
+def _nll_skipping_singular_solves(model, logits, targets):
+    """Mean NLL, dropping samples whose rate-matrix solve was singular.
+
+    Returns (nll_or_None, valid_mask). nll is None if every sample was skipped.
+    """
+    valid = getattr(model, "_last_solve_valid", None)
+    if valid is None:
+        nll = nn.functional.nll_loss(logits, targets)
+        return nll, torch.ones(logits.size(0), dtype=torch.bool, device=logits.device)
+    valid = valid.to(device=logits.device)
+    if not valid.any():
+        return None, valid
+    nll_each = nn.functional.nll_loss(logits, targets, reduction="none")
+    return nll_each[valid].mean(), valid
+
+
+def _reset_solve_stats(model):
+    reset = getattr(model, "reset_solve_stats", None)
+    if reset is not None:
+        reset()
+
+
+def _report_solve_stats(model, prefix=""):
+    report = getattr(model, "report_solve_stats", None)
+    if report is not None:
+        report(prefix=prefix)
+
+
+def _backward_skip_singular(loss, optimizer, model=None):
+    """Run backward; skip the step if autograd hits a leftover singular solve."""
+    try:
+        loss.backward()
+        return True
+    except RuntimeError as err:
+        err_msg = str(err)
+        if "singular" in err_msg.lower() or "linalg_solve" in err_msg or "linalg.solve" in err_msg:
+            add_stats = getattr(model, "_add_solve_stats", None) if model is not None else None
+            if add_stats is not None:
+                add_stats(n_backward=1)
+            optimizer.zero_grad()
+            return False
+        raise
+
+
 def train_model(model, train_loader, val_loader, device, n_epochs=200, lr=0.001, 
                 method='direct_solve', temperature=1.0, gmm=None, N=None, B=1, 
                 L=None, exact_copy=True, eval_frequency=10, n_eval_samples=500, min_max_choice=None,
@@ -38,6 +92,7 @@ def train_model(model, train_loader, val_loader, device, n_epochs=200, lr=0.001,
         dict: Training history with losses, accuracies, and ICL/IWL metrics
     """
     model.to(device)
+    _reset_solve_stats(model)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.NLLLoss()  # Use NLLLoss since model outputs log-probabilities
     
@@ -48,7 +103,8 @@ def train_model(model, train_loader, val_loader, device, n_epochs=200, lr=0.001,
         'val_acc': [],
         # ICL and IWL tracking
         'iwl_acc': [],           # In-Weight Learning
-        'icl_acc': []     # ICL Primary: Novel classes
+        'icl_acc': [],     # ICL Primary: Novel classes
+        'db_penalty': [],
         #'icl_swap_acc': []       # ICL Secondary: Label swapping
     }
     
@@ -56,6 +112,7 @@ def train_model(model, train_loader, val_loader, device, n_epochs=200, lr=0.001,
         # === Training Phase ===
         model.train()
         train_losses = []
+        train_db_penalties = []
         train_correct = 0
         train_total = 0
         
@@ -66,15 +123,20 @@ def train_model(model, train_loader, val_loader, device, n_epochs=200, lr=0.001,
             
             optimizer.zero_grad()
             logits = model(z_seq, labels, method, temperature)
-            loss = criterion(logits, targets)
-            loss.backward()
+            nll, valid = _nll_skipping_singular_solves(model, logits, targets)
+            if nll is None:
+                continue
+            loss, db_penalty = _nll_with_db_penalty(model, nll)
+            if not _backward_skip_singular(loss, optimizer, model=model):
+                continue
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             
             train_losses.append(loss.item())
+            train_db_penalties.append(db_penalty.item())
             preds = logits.argmax(dim=1)
-            train_correct += (preds == targets).sum().item()
-            train_total += targets.size(0)
+            train_correct += ((preds == targets) & valid).sum().item()
+            train_total += valid.sum().item()
         
         # === Validation Phase ===
         model.eval()
@@ -89,20 +151,22 @@ def train_model(model, train_loader, val_loader, device, n_epochs=200, lr=0.001,
                 targets = targets.to(device).long() - 1
                 
                 logits = model(z_seq, labels, method, temperature)
-                loss = criterion(logits, targets)
-                
-                val_losses.append(loss.item())
+                nll, valid = _nll_skipping_singular_solves(model, logits, targets)
+                if nll is None:
+                    continue
+                val_losses.append(nll.item())
                 preds = logits.argmax(dim=1)
-                val_correct += (preds == targets).sum().item()
-                val_total += targets.size(0)
+                val_correct += ((preds == targets) & valid).sum().item()
+                val_total += valid.sum().item()
         
-        train_acc = 100.0 * train_correct / train_total
-        val_acc = 100.0 * val_correct / val_total
+        train_acc = 100.0 * train_correct / train_total if train_total else float('nan')
+        val_acc = 100.0 * val_correct / val_total if val_total else float('nan')
         
-        history['train_loss'].append(np.mean(train_losses))
-        history['val_loss'].append(np.mean(val_losses))
+        history['train_loss'].append(np.mean(train_losses) if train_losses else float('nan'))
+        history['val_loss'].append(np.mean(val_losses) if val_losses else float('nan'))
         history['train_acc'].append(train_acc)
         history['val_acc'].append(val_acc)
+        history['db_penalty'].append(np.mean(train_db_penalties) if train_db_penalties else float('nan'))
         
         # === Evaluate ICL and IWL metrics periodically ===
         if gmm is not None and N is not None and (epoch + 1) % eval_frequency == 0:
@@ -140,7 +204,8 @@ def train_model(model, train_loader, val_loader, device, n_epochs=200, lr=0.001,
             if (epoch + 1) % eval_frequency == 0 and gmm is not None:
                 msg += f" | IWL: {iwl_acc:.2f}% | ICL: {icl_novel_acc:.2f}%"# | ICL-Swap: {icl_swap_acc:.2f}%"
             print(msg)
-    
+
+    _report_solve_stats(model)
     return history
 
 
@@ -159,6 +224,7 @@ def train_models_joint(models, train_loader, val_loader, device, n_epochs=200, l
     """
     for model in models.values():
         model.to(device)
+        _reset_solve_stats(model)
 
     optimizers = {
         name: torch.optim.Adam(model.parameters(), lr=lr)
@@ -173,7 +239,8 @@ def train_models_joint(models, train_loader, val_loader, device, n_epochs=200, l
             'train_acc': [],
             'val_acc': [],
             'iwl_acc': [],
-            'icl_acc': []
+            'icl_acc': [],
+            'db_penalty': [],
         }
 
     history = {name: init_history() for name in models.keys()}
@@ -183,6 +250,7 @@ def train_models_joint(models, train_loader, val_loader, device, n_epochs=200, l
             model.train()
 
         train_losses = {name: [] for name in models.keys()}
+        train_db_penalties = {name: [] for name in models.keys()}
         train_correct = {name: 0 for name in models.keys()}
         train_total = 0
 
@@ -194,13 +262,18 @@ def train_models_joint(models, train_loader, val_loader, device, n_epochs=200, l
             for name, model in models.items():
                 optimizers[name].zero_grad()
                 logits = model(z_seq, labels, method, temperature)
-                loss = criterion(logits, targets)
-                loss.backward()
+                nll, valid = _nll_skipping_singular_solves(model, logits, targets)
+                if nll is None:
+                    continue
+                loss, db_penalty = _nll_with_db_penalty(model, nll)
+                if not _backward_skip_singular(loss, optimizers[name], model=model):
+                    continue
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizers[name].step()
 
                 train_losses[name].append(loss.item())
-                train_correct[name] += (logits.argmax(dim=1) == targets).sum().item()
+                train_db_penalties[name].append(db_penalty.item())
+                train_correct[name] += ((logits.argmax(dim=1) == targets) & valid).sum().item()
 
             train_total += targets.size(0)
 
@@ -219,16 +292,27 @@ def train_models_joint(models, train_loader, val_loader, device, n_epochs=200, l
 
                 for name, model in models.items():
                     logits = model(z_seq, labels, method, temperature)
-                    loss = criterion(logits, targets)
-                    val_losses[name].append(loss.item())
-                    val_correct[name] += (logits.argmax(dim=1) == targets).sum().item()
+                    nll, valid = _nll_skipping_singular_solves(model, logits, targets)
+                    if nll is None:
+                        continue
+                    val_losses[name].append(nll.item())
+                    val_correct[name] += ((logits.argmax(dim=1) == targets) & valid).sum().item()
                 val_total += targets.size(0)
 
         for name in models.keys():
-            history[name]['train_loss'].append(np.mean(train_losses[name]))
-            history[name]['val_loss'].append(np.mean(val_losses[name]))
-            history[name]['train_acc'].append(100.0 * train_correct[name] / train_total)
-            history[name]['val_acc'].append(100.0 * val_correct[name] / val_total)
+            tl = train_losses[name]
+            vl = val_losses[name]
+            history[name]['train_loss'].append(np.mean(tl) if tl else float('nan'))
+            history[name]['val_loss'].append(np.mean(vl) if vl else float('nan'))
+            history[name]['train_acc'].append(
+                100.0 * train_correct[name] / train_total if train_total else float('nan')
+            )
+            history[name]['val_acc'].append(
+                100.0 * val_correct[name] / val_total if val_total else float('nan')
+            )
+            history[name]['db_penalty'].append(
+                np.mean(train_db_penalties[name]) if train_db_penalties[name] else float('nan')
+            )
 
         should_eval = gmm is not None and N is not None and (epoch + 1) % eval_frequency == 0
         if should_eval:
@@ -261,6 +345,8 @@ def train_models_joint(models, train_loader, val_loader, device, n_epochs=200, l
                     )
             print(" | ".join(segments))
 
+    for name, model in models.items():
+        _report_solve_stats(model, prefix=f"{name}: ")
     return history
 
 
